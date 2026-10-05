@@ -5,6 +5,7 @@ package workerpool
 
 import (
 	"context"
+	"sync"
 	"time"
 )
 
@@ -44,7 +45,51 @@ type Result struct {
 // перевіряє ctx.Done() (дивіться приклад slowFetch у тестах).
 func RunPool(jobs <-chan Job, numWorkers int, timeout time.Duration) <-chan Result {
 	results := make(chan Result)
-	// TODO: ваш код тут
-	close(results)
+	var wg sync.WaitGroup
+
+	wg.Add(numWorkers)
+	for range numWorkers {
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				results <- runJob(job, timeout)
+			}
+		}()
+	}
+
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
 	return results
+}
+
+// fetchResult — те, що повертає job.Fetch, упаковане для передачі
+// через канал.
+type fetchResult struct {
+	size int
+	err  error
+}
+
+// runJob виконує один Job з обмеженням часу timeout. Воркер чекає на
+// результат через select і повертається не пізніше дедлайну, навіть
+// якщо job.Fetch ігнорує ctx. Канал done буферизований, тому горутина
+// з Fetch не заблокується на надсиланні, коли воркер уже пішов далі.
+func runJob(job Job, timeout time.Duration) Result {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	done := make(chan fetchResult, 1)
+	go func() {
+		size, err := job.Fetch(ctx)
+		done <- fetchResult{size: size, err: err}
+	}()
+
+	select {
+	case r := <-done:
+		return Result{JobID: job.ID, Size: r.size, Err: r.err}
+	case <-ctx.Done():
+		return Result{JobID: job.ID, Err: ctx.Err()}
+	}
 }
